@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,16 +13,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/apache/arrow/go/v14/arrow"
-	"github.com/apache/arrow/go/v14/arrow/array"
-	"github.com/apache/arrow/go/v14/arrow/ipc"
-	"github.com/apache/arrow/go/v14/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/gorilla/websocket"
-	_ "github.com/marcboeker/go-duckdb"
+	"github.com/marcboeker/go-duckdb/v2"
 	"github.com/patrickmn/go-cache"
 )
 
@@ -212,7 +211,7 @@ func (s *Server) handleArrow(handler Handler, query Query) {
 		return
 	}
 
-	arrowData, err := s.queryToArrow(query.SQL)
+	arrowData, err := s.queryToArrowNative(query.SQL)
 	if err != nil {
 		handler.Error(fmt.Sprintf("Arrow conversion failed: %v", err))
 		return
@@ -284,108 +283,70 @@ func (s *Server) handleLoadBundle(handler Handler, query Query) {
 	handler.Done()
 }
 
-func (s *Server) queryToArrow(sql string) ([]byte, error) {
-	rows, err := s.db.Query(sql)
+func (s *Server) queryToArrowNative(sql string) ([]byte, error) {
+	// Use the native Arrow interface from go-duckdb v2
+	conn, err := s.db.Conn(context.Background())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get connection: %v", err)
 	}
-	defer rows.Close()
+	defer conn.Close()
 
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	columnTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, err
-	}
-
-	// Build Arrow schema
-	fields := make([]arrow.Field, len(columns))
-	for i, col := range columns {
-		// Simplified type mapping
-		var dataType arrow.DataType
-		switch columnTypes[i].DatabaseTypeName() {
-		case "INTEGER", "BIGINT":
-			dataType = arrow.PrimitiveTypes.Int64
-		case "DOUBLE", "REAL":
-			dataType = arrow.PrimitiveTypes.Float64
-		case "BOOLEAN":
-			dataType = &arrow.BooleanType{}
-		default:
-			dataType = arrow.BinaryTypes.String
-		}
-		fields[i] = arrow.Field{Name: col, Type: dataType}
-	}
-
-	schema := arrow.NewSchema(fields, nil)
-	mem := memory.NewGoAllocator()
-
-	// Create record builder
-	builder := array.NewRecordBuilder(mem, schema)
-	defer builder.Release()
-
-	// Read all rows
-	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
+	var arrowData []byte
+	err = conn.Raw(func(driverConn any) error {
+		dConn, ok := driverConn.(driver.Conn)
+		if !ok {
+			return fmt.Errorf("could not cast to driver.Conn")
 		}
 
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, err
+		// Get Arrow interface
+		arrow, err := duckdb.NewArrowFromConn(dConn)
+		if err != nil {
+			return fmt.Errorf("failed to create Arrow interface: %v", err)
 		}
 
-		// Add values to builders
-		for i, value := range values {
-			switch builder.Field(i).(type) {
-			case *array.Int64Builder:
-				if value == nil {
-					builder.Field(i).(*array.Int64Builder).AppendNull()
-				} else {
-					val, _ := strconv.ParseInt(fmt.Sprintf("%v", value), 10, 64)
-					builder.Field(i).(*array.Int64Builder).Append(val)
-				}
-			case *array.Float64Builder:
-				if value == nil {
-					builder.Field(i).(*array.Float64Builder).AppendNull()
-				} else {
-					val, _ := strconv.ParseFloat(fmt.Sprintf("%v", value), 64)
-					builder.Field(i).(*array.Float64Builder).Append(val)
-				}
-			case *array.BooleanBuilder:
-				if value == nil {
-					builder.Field(i).(*array.BooleanBuilder).AppendNull()
-				} else {
-					val, _ := strconv.ParseBool(fmt.Sprintf("%v", value))
-					builder.Field(i).(*array.BooleanBuilder).Append(val)
-				}
-			case *array.StringBuilder:
-				if value == nil {
-					builder.Field(i).(*array.StringBuilder).AppendNull()
-				} else {
-					builder.Field(i).(*array.StringBuilder).Append(fmt.Sprintf("%v", value))
+		// Execute query using Arrow interface
+		reader, err := arrow.QueryContext(context.Background(), sql)
+		if err != nil {
+			return fmt.Errorf("failed to execute Arrow query: %v", err)
+		}
+		defer reader.Release()
+
+		// Convert Arrow records to proper IPC format
+		var buf strings.Builder
+		mem := memory.NewGoAllocator()
+		
+		// Get the schema from the first record
+		if reader.Next() {
+			record := reader.Record()
+			schema := record.Schema()
+			
+			// Create IPC writer
+			writer := ipc.NewWriter(&buf, ipc.WithSchema(schema), ipc.WithAllocator(mem))
+			defer writer.Close()
+			
+			// Write the first record
+			if err := writer.Write(record); err != nil {
+				return fmt.Errorf("failed to write Arrow record: %v", err)
+			}
+			
+			// Write remaining records
+			for reader.Next() {
+				record := reader.Record()
+				if err := writer.Write(record); err != nil {
+					return fmt.Errorf("failed to write Arrow record: %v", err)
 				}
 			}
 		}
-	}
+		
+		arrowData = []byte(buf.String())
+		return nil
+	})
 
-	// Build record
-	record := builder.NewRecord()
-	defer record.Release()
-
-	// Serialize to Arrow IPC format
-	var buf strings.Builder
-	w := ipc.NewWriter(&buf, ipc.WithSchema(schema))
-	defer w.Close()
-
-	if err := w.Write(record); err != nil {
+	if err != nil {
 		return nil, err
 	}
 
-	return []byte(buf.String()), nil
+	return arrowData, nil
 }
 
 func (s *Server) queryToJSON(sql string) (string, error) {

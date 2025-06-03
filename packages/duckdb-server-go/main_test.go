@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/marcboeker/go-duckdb"
+	_ "github.com/marcboeker/go-duckdb/v2"
 	"github.com/patrickmn/go-cache"
 )
 
@@ -261,6 +261,40 @@ func TestUnknownCommand(t *testing.T) {
 	}
 }
 
+func TestHandleArrow(t *testing.T) {
+	server := setupTestServer()
+	defer server.db.Close()
+
+	// Create and populate test table
+	server.db.Exec("CREATE TABLE test_table (id INTEGER, name VARCHAR)")
+	server.db.Exec("INSERT INTO test_table VALUES (1, 'Alice'), (2, 'Bob')")
+
+	query := Query{
+		SQL:  "SELECT * FROM test_table ORDER BY id",
+		Type: "arrow",
+	}
+
+	recorder := httptest.NewRecorder()
+	handler := NewHTTPHandler(recorder)
+	
+	server.handleArrow(handler, query)
+	
+	if recorder.Code != http.StatusOK {
+		t.Errorf("Expected status OK, got %d", recorder.Code)
+	}
+
+	// Check that we got binary data (Arrow format)
+	if len(recorder.Body.Bytes()) == 0 {
+		t.Errorf("Expected Arrow data, got empty response")
+	}
+
+	// Check content type
+	contentType := recorder.Header().Get("Content-Type")
+	if contentType != "application/octet-stream" {
+		t.Errorf("Expected Content-Type application/octet-stream, got %s", contentType)
+	}
+}
+
 func BenchmarkJSONQuery(b *testing.B) {
 	server := setupTestServer()
 	defer server.db.Close()
@@ -279,5 +313,26 @@ func BenchmarkJSONQuery(b *testing.B) {
 		recorder := httptest.NewRecorder()
 		handler := NewHTTPHandler(recorder)
 		server.handleJSON(handler, query)
+	}
+}
+
+func BenchmarkArrowQuery(b *testing.B) {
+	server := setupTestServer()
+	defer server.db.Close()
+
+	// Setup test data
+	server.db.Exec("CREATE TABLE bench_table (id INTEGER, value DOUBLE)")
+	server.db.Exec("INSERT INTO bench_table SELECT i, random() FROM generate_series(1, 1000) as t(i)")
+
+	query := Query{
+		SQL:  "SELECT * FROM bench_table WHERE id <= 100",
+		Type: "arrow",
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		recorder := httptest.NewRecorder()
+		handler := NewHTTPHandler(recorder)
+		server.handleArrow(handler, query)
 	}
 }
